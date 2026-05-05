@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data + model weights (large, regenerable)
+data/
+runs/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Outputs
+outputs/
+runs/
+Ultralytics/
+*.mp4
+*.avi
+!notebooks/**/*.mp4         # allow small demo clips committed under notebooks/, if any
+!outputs/baselines/*.json   # always commit the metrics jsons; they're tiny and useful for tracking progress
+
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config
+.env
+*.local.yaml

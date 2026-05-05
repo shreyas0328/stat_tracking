@@ -1,0 +1,17 @@
+# Ultralytics dataset config for the SportsMOT basketball subset, after
+# conversion to YOLO format by src/data/mot_to_yolo.py.
+#
+# Pass this file to `model.train(data=...)`.
+
+# Root of the converted dataset. Override at training time if you mounted
+# your Google Drive at a different path on Colab.
+path: ../data/sportsmot_yolo
+
+# Image directories, relative to `path`.
+train: images/train
+val:   images/val
+test:  images/test
+
+# Single class: SportsMOT only annotates players (not refs / coaches).
+names:
+  0: player

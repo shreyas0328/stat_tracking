@@ -1,0 +1,30 @@
+# Core CV / ML stack
+# torch is intentionally not pinned here: on Colab it is preinstalled with
+# the right CUDA build, and on local Mac you want the MPS build. Install
+# torch separately for your platform if needed.
+ultralytics>=8.3.0          # YOLO11 + integrated BoT-SORT / ByteTrack
+lap>=0.5.0                  # Linear assignment solver required by BoT-SORT
+opencv-python>=4.9.0
+imageio>=2.34.0             # used by src/viz/overlay.py for H.264 video output
+imageio-ffmpeg>=0.5.0       # bundles a self-contained ffmpeg binary for imageio
+numpy>=1.26.0
+pandas>=2.2.0
+pyyaml>=6.0
+tqdm>=4.66.0
+matplotlib>=3.8.0
+Pillow>=10.0.0
+requests>=2.31.0            # used by scripts/download_sportsmot_sample.py for streaming
+
+# Tracking evaluation
+motmetrics>=1.4.0           # IDF1 / MOTA / MOTP; lightweight
+# trackeval is the gold-standard HOTA implementation but has a heavier
+# install footprint. Uncomment when you want HOTA numbers in addition to
+# MOTA/IDF1.
+# git+https://github.com/JonathonLuiten/TrackEval.git
+
+# Data download convenience
+huggingface-hub>=0.24.0
+gdown>=5.2.0                # for Google Drive hosted SportsMOT mirror
+
+# Notebook UX
+ipywidgets>=8.1.0
