@@ -18,30 +18,59 @@ spatial reasoning.
 | M3. Player attribution | Jersey-number OCR on key frames at the moment of a made shot to attribute the score to a specific player | not started |
 | M4. End-to-end box-score generation | Run the full pipeline on a held-out game and compare the generated box score to the official one | not started |
 
-### Current baseline (pretrained YOLO11n + BoT-SORT, no fine-tuning)
+### Current baseline: pretrained YOLO11n + BoT-SORT (no fine-tuning)
 
-Sequence: `v_BgwzTUxJaeU_c008` (SportsMOT basketball val, 500 frames @ 1280×720).
-Persisted in [`outputs/baselines/v_BgwzTUxJaeU_c008_pretrained_yolo11n.json`](outputs/baselines/).
+Evaluated on `v_BgwzTUxJaeU_c008` (SportsMOT basketball val, 500 frames @ 1280×720).
 
-| Metric | Value | Read |
-|--------|------:|------|
-| MOTA | **0.221** | Bad — anything < 0.5 is poor for sports MOT |
-| IDF1 | **0.227** | Bad — identity assignment is unreliable |
-| MOTP | 0.187 | Box localization on true matches is decent |
-| num_false_positives | **2,358** | The killer: refs/coaches/fans detected as "person" |
-| num_misses | 1,034 | Some players (small/distant) not detected |
-| num_switches | 94 | ID flips across the 500 frames |
-| Predictions / GT box count | 5,799 / 4,475 | 30% over-detection due to non-players |
-| Unique track IDs | 158 | vs ~10–13 actual people → ~13× ID inflation |
-| Inference speed | 8.1 fps on CPU | M-series Mac with `--device mps` would be ~3× faster |
+| Metric | Ground truth | Pretrained YOLO11n |
+|---|:---:|:---:|
+| MOTA | 1.000 | **0.221** |
+| IDF1 | 1.000 | **0.227** |
+| ID switches | 0 | 94 |
+| False positives | 0 | 2,358 |
+| Misses | 0 | 1,034 |
+| Total detections | 4,475 | 5,799 |
+| **Unique people / track IDs** | **10** | **158** |
+| Inference speed | — | 8.1 fps (CPU) |
 
-These numbers are exactly the "ugly baseline" we want to demonstrate the
-value of fine-tuning against. Almost the entire MOTA gap comes from
-COCO-pretrained YOLO firing on every person in the broadcast frame, not
-just on-court players. SportsMOT only labels the 10 active players — so a
-fine-tuned model learns "player" is more specific than "person," which
-should drop FP count by 60–80% and lift MOTA into the 0.6–0.8 range
-without any other changes.
+The pretrained model invents 158 unique people in a clip with 10 actual
+players, and over-detects by 30% because COCO's "person" class doesn't
+distinguish the on-court 10 from the refs, coaches, and fans courtside.
+Fine-tuning on SportsMOT's `gt.txt` is what teaches the detector that
+"player" ≠ "person" — and is the path to the 0.6–0.8 MOTA range.
+
+Full live table including run-level commentary:
+[`outputs/baselines/COMPARISON.md`](outputs/baselines/COMPARISON.md)
+(regenerate with `python scripts/compare_baselines.py` after every new run).
+
+### What the files in `outputs/baselines/` mean
+
+For each pipeline run (ground truth, pretrained model, future fine-tuned
+model, etc.), three files are saved under `outputs/baselines/` with a
+shared `<sequence>_<tag>` prefix:
+
+| File | What's in it |
+|------|--------------|
+| `..._<tag>.mp4`  | The video with bounding boxes + track IDs drawn on every frame. **Watch this** to see qualitatively how a run behaves. |
+| `..._<tag>.txt`  | MOT-Challenge format predictions: one line per detected box, schema `frame, track_id, x, y, w, h, conf, -1, -1, -1`. Used as input to the metric computation. |
+| `..._<tag>.json` | Run metadata + the tracking metrics that came out of `motmetrics`. The comparison script reads these to build the table. |
+
+Three `<tag>`s are meaningful and worth keeping:
+
+- **`groundtruth`** — produced from SportsMOT's `gt.txt` directly. The
+  upper bound. By definition gets MOTA = IDF1 = 1.000. Generate with
+  `python scripts/render_groundtruth.py`.
+- **`pretrained_yolo11n`** — what an off-the-shelf, untrained model
+  produces. Today's "before" baseline. Generate with
+  `python scripts/run_baseline.py`.
+- **`finetuned_yolo11s`** *(coming after the Colab fine-tune)* — what a
+  basketball-specific model produces. The "after" we're trying to
+  achieve. Generate with `python scripts/run_baseline.py --weights best.pt --tag finetuned_yolo11s --no-class-filter`.
+
+Watching the three MP4s back-to-back makes the "why train at all" question
+intuitive: ground-truth boxes are tight on the 10 active players only,
+the pretrained model boxes everyone in the frame, and a fine-tuned model
+should look much closer to ground truth than to the pretrained run.
 
 ---
 
@@ -106,16 +135,40 @@ What it does, end to end:
    - `..._pretrained_yolo11n.mp4`  — annotated video
    - `..._pretrained_yolo11n.json` — run metadata + tracking metrics
 
-### Step 5 — actually look at the result
+### Step 5 — render the ground-truth reference
 
 ```bash
+python scripts/render_groundtruth.py
+```
+
+This builds the "what perfect human annotation looks like" video from
+SportsMOT's `gt.txt` directly. It's the upper bound any model is trying
+to approach.
+
+### Step 6 — generate the comparison table
+
+```bash
+python scripts/compare_baselines.py
+```
+
+Writes `outputs/baselines/COMPARISON.md` with a markdown table comparing
+every run you've done on every sequence (ground truth always shown as
+the upper bound, model runs as columns next to it).
+
+### Step 7 — actually look at the result
+
+```bash
+# What perfect annotation looks like (gold standard, 10 players boxed)
+open outputs/baselines/v_BgwzTUxJaeU_c008_groundtruth.mp4
+
+# What the off-the-shelf model produces (158 inflated tracks)
 open outputs/baselines/v_BgwzTUxJaeU_c008_pretrained_yolo11n.mp4
 ```
 
-You'll see all 500 frames with colored boxes + numbered IDs. Watch for
-the failure modes the metrics quantify: refs in striped shirts boxed as
-"player," IDs flipping when players cross paths, occasional missed
-players in the paint.
+Watching them back-to-back makes the failure modes quantified in the
+metrics table viscerally obvious: refs in striped shirts boxed as
+"player," IDs flipping every time players cross paths, missed players in
+the paint.
 
 ### Try it on different content
 
@@ -145,21 +198,16 @@ python scripts/demo_detect.py --source 0
 | **Fine-tune YOLO11s on the basketball subset** | **Colab A100** | this is the only step that genuinely needs a GPU |
 | Run inference with the fine-tuned model | **Local** | inference is fast on CPU; just download `best.pt` from Colab |
 
-The Colab notebooks are *only* for the steps that need an A100. Specifically:
+The Colab notebooks are *only* for the steps that benefit from being on
+the same Drive that the A100 reads from. Run them in order:
 
-- `notebooks/01_download_and_convert.ipynb` — downloads the full SportsMOT
-  basketball subset, converts it to YOLO format, mounts Google Drive so
-  the converted dataset persists across Colab runtime restarts. **Use a
-  free T4 runtime — this step needs no GPU; it's only on Colab so the
-  output lands on the same Drive that the next notebook reads from.**
-- `notebooks/02_smoke_test_train.ipynb` *(planned)* — fine-tune YOLO11n
-  for 5 epochs on a tiny subset to verify the training pipeline before
-  spending A100 hours. **Free T4.**
-- `notebooks/03_train_yolo.ipynb` *(planned)* — the real fine-tune of
-  YOLO11s on the full basketball train split. **A100; ~2 hours.**
+| Notebook | Runtime | Purpose | Wall time |
+|----------|---------|---------|----------:|
+| [`01_download_and_convert.ipynb`](notebooks/01_download_and_convert.ipynb) | **Free T4** | Downloads `train.tar` + `val.tar` from SportsMOT's HF mirror, extracts them, converts the basketball subset to YOLO format, persists output to Drive | ~15 min |
+| [`03_train_yolo.ipynb`](notebooks/03_train_yolo.ipynb) | **A100** | Fine-tune YOLO11s for ~30 epochs on the full basketball train split, evaluate mAP + tracking metrics, save `best.pt` to Drive | ~2 hours |
 
-After the Colab fine-tune finishes, you download the resulting
-`best.pt` back to your local machine and re-run the same baseline command:
+After notebook 03 finishes, download the resulting `best.pt` back to
+your local machine and re-run the same baseline command:
 
 ```bash
 python scripts/run_baseline.py \
@@ -193,7 +241,9 @@ stat_tracking/
 ├── notebooks/                          # all Colab-runnable
 │   └── 01_download_and_convert.ipynb   # MOT → YOLO; T4
 ├── scripts/                            # local CLI entrypoints
-│   ├── run_baseline.py                 # ★ one-command repro of the pretrained baseline
+│   ├── run_baseline.py                 # ★ one-command repro of a model baseline
+│   ├── render_groundtruth.py           # produce the GT reference video + metrics
+│   ├── compare_baselines.py            # build COMPARISON.md from baseline JSONs
 │   ├── demo_detect.py                  # detect+track on any video / image folder / webcam
 │   ├── download_sportsmot_sample.py    # stream-extract N basketball seqs from HF
 │   └── download_sportsmot.sh           # full-dataset download wrapper
