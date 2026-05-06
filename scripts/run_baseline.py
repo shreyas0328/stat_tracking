@@ -57,6 +57,14 @@ def main() -> int:
     p.add_argument("--conf", type=float, default=0.30)
     p.add_argument("--device", default=None, help="torch device: cpu, mps, or cuda id")
     p.add_argument(
+        "--tracker",
+        default="botsort.yaml",
+        help="Path to a tracker YAML, or one of Ultralytics' built-ins "
+             "('botsort.yaml', 'bytetrack.yaml'). Use "
+             "'configs/botsort_persistent.yaml' for the basketball-tuned "
+             "config with ReID enabled and longer track buffer.",
+    )
+    p.add_argument(
         "--no-class-filter",
         action="store_true",
         help="Don't filter to class 0. Use for fine-tuned single-class models.",
@@ -122,12 +130,27 @@ def main() -> int:
     json_path  = args.out / f"{args.seq}_{args.tag}.json"
 
     classes = None if args.no_class_filter else [0]
-    print(f"[detect] running {args.weights} + BoT-SORT on {len(list(img_dir.glob('*.jpg')))} frames...")
+    # If user gave a relative path to a custom tracker config, resolve it to
+    # an absolute path; Ultralytics' loader looks for built-in names first
+    # then falls back to the path on disk.
+    tracker_arg = args.tracker
+    if tracker_arg not in ("botsort.yaml", "bytetrack.yaml"):
+        candidate = Path(tracker_arg)
+        if not candidate.is_absolute():
+            candidate = (ROOT / candidate).resolve()
+        if candidate.exists():
+            tracker_arg = str(candidate)
+        else:
+            print(f"[warn] tracker config not found at {candidate}; "
+                  f"falling back to Ultralytics built-in {args.tracker!r}")
+    print(f"[detect] running {args.weights} + tracker={tracker_arg} on "
+          f"{len(list(img_dir.glob('*.jpg')))} frames...")
     t0 = time.time()
     from src.tracking.botsort_runner import track_video
     df = track_video(
         weights=args.weights,
         source=str(img_dir),
+        tracker=tracker_arg,
         classes=classes,
         conf=args.conf,
         imgsz=args.imgsz,
@@ -165,6 +188,7 @@ def main() -> int:
     record = {
         "tag": args.tag,
         "weights": args.weights,
+        "tracker": tracker_arg,
         "seq": args.seq,
         "frames": n_frames,
         "imgsz": args.imgsz,

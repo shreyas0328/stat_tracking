@@ -33,18 +33,28 @@ def draw_on_frame(
     frame: np.ndarray,
     boxes: list[tuple[int, float, float, float, float]],
     thickness: int = 2,
+    labels: dict[int, str] | None = None,
+    colors: dict[int, tuple[int, int, int]] | None = None,
 ) -> np.ndarray:
     """Draw boxes on a frame in-place-ish (returns the same array).
 
     Args:
         frame: HxWx3 BGR uint8 array
         boxes: list of (track_id, x, y, w, h) in pixel coords
+        labels: optional ``{track_id: label_string}`` override. If a track
+            ID is not in the dict (or dict is None), defaults to
+            ``f"#{track_id}"``.
+        colors: optional ``{track_id: (B, G, R)}`` override. Useful for
+            colour-coding by identification confidence (e.g. green for
+            high-confidence clusters, yellow for medium, red for low).
+            Falls back to per-ID hue if absent.
     """
     for track_id, x, y, w, h in boxes:
         x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
-        color = _id_to_color(int(track_id))
+        tid = int(track_id)
+        color = (colors or {}).get(tid) or _id_to_color(tid)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-        label = f"#{int(track_id)}"
+        label = (labels or {}).get(tid) or f"#{tid}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
         cv2.putText(
@@ -98,6 +108,8 @@ def render_video(
     predictions: pd.DataFrame | str | Path,
     out_path: str | Path,
     fps: float = 25.0,
+    labels: dict[int, str] | None = None,
+    colors: dict[int, tuple[int, int, int]] | None = None,
 ) -> Path:
     """Write an annotated H.264 MP4 to out_path.
 
@@ -106,6 +118,10 @@ def render_video(
 
     Frames are streamed through the encoder one at a time, so memory usage
     stays bounded regardless of clip length.
+
+    ``labels`` / ``colors`` are passed through to :func:`draw_on_frame` to
+    support custom per-ID overlays (e.g. confidence colour-coding) without
+    changing the prediction file itself.
     """
     df = _load_predictions(predictions)
     out_path = Path(out_path)
@@ -120,8 +136,8 @@ def render_video(
                 raise RuntimeError(f"No .jpg frames found in {source}")
             for i, fp in enumerate(frame_paths, start=1):
                 frame = cv2.imread(str(fp))
-                annotated = draw_on_frame(frame, _frame_boxes(df, i))
-                # imageio expects RGB; OpenCV gives us BGR.
+                annotated = draw_on_frame(frame, _frame_boxes(df, i),
+                                          labels=labels, colors=colors)
                 writer.append_data(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
         else:
             cap = cv2.VideoCapture(str(source))
@@ -134,7 +150,8 @@ def render_video(
                     if not ok:
                         break
                     i += 1
-                    annotated = draw_on_frame(frame, _frame_boxes(df, i))
+                    annotated = draw_on_frame(frame, _frame_boxes(df, i),
+                                              labels=labels, colors=colors)
                     writer.append_data(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
             finally:
                 cap.release()

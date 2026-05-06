@@ -17,6 +17,7 @@ env/
 # Data + model weights (large, regenerable)
 data/
 runs/
+models/                     # local cache for embedder backbone weights, fine-tuned YOLO checkpoints, etc.
 *.pt
 *.pth
 *.onnx

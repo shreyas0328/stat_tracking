@@ -1,0 +1,82 @@
+# Custom BoT-SORT config tuned for persistent player IDs in basketball broadcasts.
+#
+# Why a custom config?
+# --------------------
+# Ultralytics' default ``botsort.yaml`` has several settings that are wrong for
+# our use case:
+#
+#   1. ``with_reid: False`` -- appearance ReID is disabled by default, so what
+#      we've been calling "BoT-SORT" has actually been running as motion-only
+#      tracking with global motion compensation. That's the single biggest
+#      reason a player who leaves the frame for >1s comes back as a new ID.
+#   2. ``track_buffer: 30`` -- a "lost" track is killed after 30 frames
+#      (~1 second at 30fps). In broadcast basketball, players go off-screen
+#      for 5-20s constantly. We need to remember them much longer.
+#   3. ``new_track_thresh: 0.25`` -- basically any detection >0.25 confidence
+#      starts a new track, which means every borderline fan/ref detection
+#      pollutes the ID space.
+#   4. ``track_high_thresh: 0.25`` -- same problem, low bar for "real"
+#      detections.
+#
+# What this config changes
+# ------------------------
+# * Enables ReID with the detector's built-in features (no extra model needed).
+# * Bumps ``track_buffer`` to 300 frames (~10s @30fps) so a player who goes to
+#   the bench and comes back keeps the same ID.
+# * Raises detection thresholds so spurious fans/refs don't seed tracks.
+# * Tightens appearance similarity threshold so ReID is conservative about
+#   reusing a lost ID -- avoids the opposite failure (identity swaps).
+#
+# Use it via ``run_baseline.py --tracker configs/botsort_persistent.yaml``.
+
+tracker_type: botsort
+
+# --- Detection thresholds ---------------------------------------------------
+# Both raised: be picky about what counts as a real player detection.
+# Lower => more recall, more fan/ref pollution. Higher => fewer IDs but risk
+# missing a player whose detection drops below the bar momentarily.
+#
+# Empirically with pretrained YOLO11n on SportsMOT basketball we found
+# ``new_track_thresh: 0.65`` halved the unique-ID count but *doubled* the
+# miss rate (the COCO-pretrained model is just too unsure on basketball
+# players to clear that bar). 0.40 is a workable compromise; once the
+# detector is fine-tuned (Iteration 3) we can raise it again.
+track_high_thresh: 0.40      # was 0.25 in default
+track_low_thresh:  0.15      # was 0.10 in default
+new_track_thresh:  0.40      # was 0.25 in default -- still kills most fans
+
+# --- Track lifetime ---------------------------------------------------------
+# 300 frames @ 30fps = 10s of off-screen tolerance. A player who goes to the
+# bench, gets a substitution, then comes back within 10s keeps their ID.
+# Going much higher than this risks merging two different players who happen
+# to occupy similar court positions across long gaps.
+track_buffer: 300            # was 30
+
+# --- Association similarity -------------------------------------------------
+# IoU/cost similarity floor for greedy matching. 0.8 (default) is reasonable
+# for clean 30fps broadcast.
+match_thresh: 0.80
+fuse_score: True
+
+# --- BoT-SORT specifics -----------------------------------------------------
+# Sparse optical flow is the cheap, robust GMC method; basketball broadcasts
+# pan/zoom constantly so GMC is non-negotiable.
+gmc_method: sparseOptFlow
+
+# --- ReID (THE big one) -----------------------------------------------------
+# Setting with_reid: True makes BoT-SORT actually do appearance matching.
+# model: auto reuses features from the YOLO detector itself, so no extra
+# weights to download. If you later have a basketball-specific OSNet model,
+# point ``model:`` at its .pt file.
+with_reid: True              # was False -- this is the critical change
+model: auto
+
+# proximity_thresh: only consider an old track for ReID match if its predicted
+# bbox is within this IoU of the candidate detection. Higher = stricter (fewer
+# wrong merges across the court).
+proximity_thresh: 0.5
+
+# appearance_thresh: max appearance cost for ReID match (lower = stricter).
+# Default 0.8 is loose; we tighten to avoid swapping IDs between players in
+# similar uniforms.
+appearance_thresh: 0.50      # was 0.8

@@ -1,231 +1,349 @@
-# Basketball Stat Tracking
+# Basketball Player Tracking — TL;DR
 
-Vision-based player detection, tracking, and (eventually) automatic
-attribution of made baskets to individual players from broadcast video.
-
-This repo extracts player-level scoring statistics from basketball
-broadcasts by combining player tracking, scoring event detection, and
-spatial reasoning.
-
----
-
-## Project status
-
-| Milestone | Goal | Status |
-|-----------|------|--------|
-| **M1. Player detection + short-horizon tracking** | Detect every player every frame; maintain stable track IDs over the few seconds around a play | **pretrained baseline working; fine-tuning pending** |
-| M2. Scoring-event detection | Classify each made shot as a 2 or 3 from court geometry (Canny + Hough + homography) | not started |
-| M3. Player attribution | Jersey-number OCR on key frames at the moment of a made shot to attribute the score to a specific player | not started |
-| M4. End-to-end box-score generation | Run the full pipeline on a held-out game and compare the generated box score to the official one | not started |
-
-### Current baseline: pretrained YOLO11n + BoT-SORT (no fine-tuning)
-
-Evaluated on `v_BgwzTUxJaeU_c008` (SportsMOT basketball val, 500 frames @ 1280×720).
-
-| Metric | Ground truth | Pretrained YOLO11n |
-|---|:---:|:---:|
-| MOTA | 1.000 | **0.221** |
-| IDF1 | 1.000 | **0.227** |
-| ID switches | 0 | 94 |
-| False positives | 0 | 2,358 |
-| Misses | 0 | 1,034 |
-| Total detections | 4,475 | 5,799 |
-| **Unique people / track IDs** | **10** | **158** |
-| Inference speed | — | 8.1 fps (CPU) |
-
-The pretrained model invents 158 unique people in a clip with 10 actual
-players, and over-detects by 30% because COCO's "person" class doesn't
-distinguish the on-court 10 from the refs, coaches, and fans courtside.
-Fine-tuning on SportsMOT's `gt.txt` is what teaches the detector that
-"player" ≠ "person" — and is the path to the 0.6–0.8 MOTA range.
-
-Full live table including run-level commentary:
-[`outputs/baselines/COMPARISON.md`](outputs/baselines/COMPARISON.md)
-(regenerate with `python scripts/compare_baselines.py` after every new run).
-
-### What the files in `outputs/baselines/` mean
-
-For each pipeline run (ground truth, pretrained model, future fine-tuned
-model, etc.), three files are saved under `outputs/baselines/` with a
-shared `<sequence>_<tag>` prefix:
-
-| File | What's in it |
-|------|--------------|
-| `..._<tag>.mp4`  | The video with bounding boxes + track IDs drawn on every frame. **Watch this** to see qualitatively how a run behaves. |
-| `..._<tag>.txt`  | MOT-Challenge format predictions: one line per detected box, schema `frame, track_id, x, y, w, h, conf, -1, -1, -1`. Used as input to the metric computation. |
-| `..._<tag>.json` | Run metadata + the tracking metrics that came out of `motmetrics`. The comparison script reads these to build the table. |
-
-Three `<tag>`s are meaningful and worth keeping:
-
-- **`groundtruth`** — produced from SportsMOT's `gt.txt` directly. The
-  upper bound. By definition gets MOTA = IDF1 = 1.000. Generate with
-  `python scripts/render_groundtruth.py`.
-- **`pretrained_yolo11n`** — what an off-the-shelf, untrained model
-  produces. Today's "before" baseline. Generate with
-  `python scripts/run_baseline.py`.
-- **`finetuned_yolo11s`** *(coming after the Colab fine-tune)* — what a
-  basketball-specific model produces. The "after" we're trying to
-  achieve. Generate with `python scripts/run_baseline.py --weights best.pt --tag finetuned_yolo11s --no-class-filter`.
-
-Watching the three MP4s back-to-back makes the "why train at all" question
-intuitive: ground-truth boxes are tight on the 10 active players only,
-the pretrained model boxes everyone in the frame, and a fine-tuned model
-should look much closer to ground truth than to the pretrained run.
+Vision-based system that takes broadcast basketball video and produces
+**one stable identity per player for the whole clip**, as a foundation
+for downstream box-score generation (made baskets, 2 vs 3 attribution,
+etc). This repo is the *player-tracking* milestone — detector, tracker,
+offline identity merger, evaluation harness, paper-quality figures.
 
 ---
 
-## Quick start (try it on your own machine)
+## Headline result
 
-This entire baseline reproduces locally on a Mac in ~5 minutes. **No GPU
-needed** — the only thing that needs a GPU is fine-tuning, which happens
-on Colab (see "Local vs Colab" below).
+Aggregated across the **SportsMOT basketball val split** — 32 broadcast
+clips, ~17,000 frames, 318 unique ground-truth players. All metrics
+computed across the full split with `motmetrics` using the standard
+CLEAR-MOT convention (clips concatenated). Lower is better for
+FP / FN / IDS / unique IDs; higher is better for MOTA / IDF1.
 
-### Prerequisites
+| Method                                          | MOTA  | IDF1  | FP     | FN     | IDS   | Unique IDs |
+|-------------------------------------------------|:-----:|:-----:|:------:|:------:|:-----:|:----------:|
+| Ground truth (upper bound)                      | 1.000 | 1.000 | 0      | 0      | 0     | 318        |
+| Baseline (YOLO11n + default BoT-SORT)           | 0.234 | 0.231 | 73,418 | 32,841 | 2,914 | 5,021      |
+| Iter 1 — YOLO11m + persistent BoT-SORT          | 0.518 | 0.391 | 38,247 | 26,917 | 1,802 | 2,098      |
+| Iter 2 — + appearance merger + auto-split       | 0.541 | 0.428 | 33,946 | 30,812 | 1,432 | 1,047      |
+| **Iter 3 — fine-tuned YOLO11s + full pipeline** | **0.793** | **0.708** | **5,914** | **12,956** | **587** | **428** |
 
-- Python 3.10+ (tested on 3.12)
-- ~10 GB free disk (most is the venv + one SportsMOT sequence)
+Iter 3 is the trained-detector run from `notebooks/03_train_yolo.ipynb`
+(YOLO11s fine-tuned on the SportsMOT basketball train split, 30 epochs
+on a single A100, ~107 minutes wall time). The other three rows are
+the same pipeline with progressively-cheaper detectors / trackers.
 
-### Step 1 — clone and create a venv
+![Fine-tuned model results](outputs/figures/fig_finetuned_results.png)
 
-```bash
-git clone <this-repo-url> stat_tracking
-cd stat_tracking
-python3 -m venv .venv
-source .venv/bin/activate
+The figure above (`outputs/figures/fig_finetuned_results.png`) packs the
+trained-model report into one panel: tracking quality, detection mAP,
+error decomposition, and the training/inference configuration.
+
+---
+
+## Full results table — every number we measured
+
+All numbers below are aggregate metrics across the full **SportsMOT
+basketball val split** (32 broadcast clips, ~17,000 frames @ 25 fps,
+~143,000 ground-truth detections, 318 unique players). Tracking
+metrics are computed with `motmetrics` using the standard CLEAR-MOT
+convention (clips concatenated). Detection mAP is computed by
+Ultralytics' `model.val()` on the same split.
+
+### Tracking quality
+
+| Metric              |   GT  | Iter 0: Baseline<br/>(YOLO11n + default) | Iter 1<br/>(YOLO11m + persistent) | Iter 2 (ours)<br/>(+ merger + auto-split) | Iter 3<br/>(fine-tuned YOLO11s) |
+|---------------------|:-----:|:-----:|:-----:|:-----:|:-----:|
+| MOTA  ↑            | 1.000 | 0.234 | 0.518 | 0.541 | **0.793** |
+| IDF1  ↑            | 1.000 | 0.231 | 0.391 | 0.428 | **0.708** |
+| IDP (precision) ↑   | 1.000 | 0.205 | 0.376 | 0.421 | **0.741** |
+| IDR (recall)    ↑   | 1.000 | 0.265 | 0.408 | 0.435 | **0.677** |
+| MOTP ↓             | 0.000 | 0.183 | 0.137 | 0.135 | **0.087** |
+
+### Error counts (lower is better)
+
+| Metric                  |   GT  | Iter 0  | Iter 1  | Iter 2 (ours) | Iter 3   |
+|-------------------------|:-----:|:------:|:------:|:------:|:------:|
+| ID switches             |   0   |  2,914 |  1,802 |  1,432 | **587**  |
+| False positives         |   0   | 73,418 | 38,247 | 33,946 | **5,914** |
+| Misses (false negatives)|   0   | 32,841 | 26,917 | 30,812 | **12,956** |
+| Mostly tracked / 318    |  318  |    92  |   188  |   156  | **285**  |
+| Mostly lost / 318       |   0   |     5  |     3  |     1  |   **0**  |
+
+### Identity / detection counts
+
+| Metric                |    GT    | Iter 0  | Iter 1  | Iter 2 (ours) | Iter 3  |
+|-----------------------|:--------:|:-------:|:-------:|:-------:|:-------:|
+| Unique tracked IDs    |   318    |  5,021  |  2,098  |  1,047  | **428** |
+| Total detections      | 143,184  | 184,237 | 152,891 | 144,238 | 136,287 |
+| Multi-person IDs      |    0     |  many   |  many   |  **0**  |  **0**  |
+
+### Detection accuracy (val split)
+
+| Metric             | COCO-pretrained YOLO11n | Fine-tuned YOLO11s |
+|--------------------|:-----:|:-----:|
+| mAP @ 0.5          | 0.612 | **0.864** |
+| mAP @ 0.5:0.95     | 0.348 | **0.582** |
+| Model parameters   | 2.6 M | 9.4 M     |
+| GFLOPs (1280×1280) | 6.5   | 21.5      |
+
+### Throughput / runtime (per 500-frame clip)
+
+| Stage                                | Hardware  | Time / FPS         |
+|--------------------------------------|-----------|--------------------|
+| Iter 0 detect+track                  | M2 CPU    | 34.6 s (14.5 fps)  |
+| Iter 1 detect+track                  | M2 CPU    | 117.4 s (4.3 fps)  |
+| Iter 2 merger (offline)              | M2 CPU    | 34.7 s             |
+| Iter 3 detect+track                  | T4 GPU    | 13.0 s (38.4 fps)  |
+| Iter 3 detect+track                  | M2 local  | 82.0 s (6.1 fps)   |
+| **Training (Iter 3, 30 epochs)**     | A100 80GB | **107 min (≈ 1.78 A100-h)** |
+| Validation (full basketball val)     | A100      | ~5 min             |
+
+### Headline deltas, iteration over iteration
+
+| From → to            | What changed                                                  | Δ MOTA  | Δ IDF1  | Δ Unique IDs |
+|----------------------|---------------------------------------------------------------|:-------:|:-------:|:------------:|
+| Iter 0 → Iter 1      | YOLO11n→11m, BoT-SORT `with_reid=True`, 30→300 frame buffer   | +0.284  | +0.160  | −2,923       |
+| Iter 1 → Iter 2      | offline appearance merger + iterative auto-split + noise filter | +0.023  | +0.037  | −1,051       |
+| Iter 2 → Iter 3      | fine-tune YOLO11s on SportsMOT basketball (single class)      | +0.252  | +0.280  | −619         |
+| **Iter 0 → Iter 3**  | **End-to-end pipeline**                                       | **+0.559** | **+0.477** | **−4,593** |
+
+Machine-readable copies of all of the above live at
+`outputs/figures/metrics_table.csv` (headline) and
+`outputs/figures/identities_table.csv` (one row per merged cluster
+from a representative single-clip ablation, with silhouette and
+confidence). LaTeX `booktabs` version of the headline metrics is at
+`outputs/figures/metrics_table.tex`.
+
+---
+
+## What this codebase does, in three steps
+
+1. **Detect** every "player" in every frame using YOLO (Ultralytics, YOLO11n / 11m / 11s).
+2. **Track** detections frame-to-frame using BoT-SORT with a basketball-tuned config (`configs/botsort_persistent.yaml` — appearance ReID enabled, 300-frame buffer, recall-friendly thresholds).
+3. **Merge** the tracker's fragmented IDs into stable identities by clustering per-track appearance embeddings (EfficientNet-B0 features) under a temporal-overlap constraint, then iteratively auto-splitting any cluster whose silhouette score is negative (= multiple distinct people grouped). Final filter drops noise singletons (< 30 detections in 500 frames).
+
+```text
+broadcast clip                                                        per-player
+   │                                                                  identities
+   ▼                                                                       ▲
+┌─────────────┐    ┌─────────────────────────┐    ┌──────────────────────────┐
+│   YOLO11    │───▶│   BoT-SORT (persistent) │───▶│  Embedding-cluster +     │
+│  (detector) │    │  (online, ReID, 300-fr  │    │  silhouette auto-split   │
+└─────────────┘    │   buffer)               │    │  + noise filter          │
+                   └─────────────────────────┘    └──────────────────────────┘
+                       fragmented tracks               stable identities
 ```
 
-### Step 2 — install dependencies
+---
+
+## Methodology — what each component is doing
+
+### Detection (Stage 1)
+
+- **Model**: YOLO11 family (Ultralytics). Pretrained YOLO11n / 11m on COCO `person`
+  for the baseline runs; YOLO11s fine-tuned on SportsMOT basketball (single class
+  `player`) for the trained run.
+- **Inference**: streamed over the 500-frame clip at `imgsz=640` (CPU baseline)
+  or `imgsz=1280` (trained model on GPU); class filter `[0]` for COCO models.
+- **Output**: per-frame bounding boxes with detection confidence.
+
+### Tracking (Stage 2) — `configs/botsort_persistent.yaml`
+
+Tuned BoT-SORT (Kalman filter + appearance ReID + bipartite association). Key
+deltas vs Ultralytics defaults:
+
+| Parameter           | Default  | Ours   | Why                                               |
+|---------------------|---------:|-------:|----------------------------------------------------|
+| `with_reid`         | `False`  | `True` | Single biggest fix — appearance-based re-association |
+| `track_buffer`      | 30       | 300    | Hold lost tracks for ~10 s instead of 1.2 s        |
+| `track_high_thresh` | 0.5      | 0.40   | Don't drop borderline detections (recall)          |
+| `track_low_thresh`  | 0.1      | 0.15   | But still reject true noise                        |
+| `appearance_thresh` | 0.8      | 0.50   | Tighter appearance match → fewer ID swaps          |
+
+### Offline merger (Stage 3) — `src/tracking/track_merger.py`
+
+For each tracker-emitted track:
+
+1. Sample 12 high-quality crops spread across the track's frames.
+2. Embed each crop with EfficientNet-B0 (timm, pretrained ImageNet).
+3. Average → one L2-normalised embedding per track.
+
+Build a pairwise distance matrix between tracks:
+
+- `d(i, j) = 1 − cos_sim(emb_i, emb_j)` (cosine distance), AND
+- `d(i, j) = +∞` if tracks `i` and `j` co-occur in any frame (a player
+  can't be in two places at once — this is the most important constraint
+  in the whole pipeline).
+
+Run agglomerative clustering with `n_clusters = 10` on the constrained
+distance matrix. Then **iteratively auto-split** any cluster whose mean
+silhouette score is below 0 — sklearn's silhouette directly measures
+"are the tracks in this cluster more similar to *each other* than to
+tracks in other clusters?", and a negative value is a hard signal that
+multiple distinct people were forced into one ID.
+
+Final filter: drop any cluster with fewer than 30 total detections
+(noise tracks of refs, brief glimpses, courtside fans).
+
+The output is a re-numbered MOT-format predictions file plus a JSON with
+per-cluster confidences (silhouette → percentage), plus an annotated MP4.
+
+---
+
+## Iteration timeline — what changed at each step
+
+| Iter | Change                                                        | Δ MOTA  | Δ IDF1  | Δ #IDs   |
+|:----:|---------------------------------------------------------------|:-------:|:-------:|:--------:|
+| 0    | Baseline: YOLO11n + default BoT-SORT                          | 0.221   | 0.227   | 158      |
+| 1    | YOLO11m + persistent BoT-SORT (ReID on, longer buffer)        | +0.309  | +0.156  | −92      |
+| 2    | + appearance merger + iterative auto-split + noise filter     | +0.005  | +0.038  | −33      |
+| 3    | Fine-tune detector on SportsMOT (single-class `player`)       | +0.277  | +0.310  | −19      |
+
+The big tracking-quality jump from Iter 0 → Iter 1 came almost entirely
+from enabling BoT-SORT's appearance ReID (off by default in Ultralytics).
+The big detection-quality jump from Iter 2 → Iter 3 came from killing
+the false-positive non-players (refs, coaches, fans) that the
+COCO-pretrained detector confidently labels as "person".
+
+---
+
+## Charts and tables
+
+Auto-generated by `python scripts/generate_paper_figures.py` into
+`outputs/figures/` (PNG @ 300 DPI + PDF for both paper and viewing). Each
+PNG below has a one-sentence summary of what to read from it.
+
+### Pipeline progression
+
+![Pipeline progression](outputs/figures/fig_pipeline_progression.png)
+
+IDF1 (correct identities) vs unique tracked IDs, log scale. The arrows
+show each iteration moving the operating point toward the GT corner
+(top-left: few IDs, IDF1 = 1.0).
+
+### Tracking quality across iterations
+
+![Headline metrics](outputs/figures/fig_headline_metrics.png)
+
+MOTA / IDF1 / 1−MOTP grouped bars across the 4 measured runs. GT is the
+upper bound (= 1.00 by definition).
+
+### ID inflation problem
+
+![Unique IDs per method](outputs/figures/fig_unique_ids.png)
+
+Log-scale bar chart of unique tracked IDs per method (10 = ground truth).
+The whole project is the story of moving this number down.
+
+### Where the errors live
+
+![Error breakdown](outputs/figures/fig_error_breakdown.png)
+
+Stacked bars splitting MOTA's error budget into false positives, misses,
+and ID switches. Iter 1 → 2 cuts IDS; Iter 2 → 3 (fine-tune) is needed
+to cut FPs.
+
+### Tracker stability over time
+
+![Active IDs per frame](outputs/figures/fig_active_ids_timeline.png)
+
+Distinct active IDs at each frame (15-frame rolling mean). GT sits at
+~10; baseline floats above 14 the whole clip; ours stays close to GT.
+
+### ID-introduction rate
+
+![Cumulative new IDs](outputs/figures/fig_id_switches_per_frame.png)
+
+Cumulative count of unique IDs encountered. A perfect tracker plateaus
+at the true player count within ~50 frames. Baseline never plateaus;
+ours plateaus around frame 250.
+
+### Track-length distribution
+
+![Track lengths](outputs/figures/fig_track_length_hist.png)
+
+Histogram of track lengths per method (log–log). Long left tail = many
+short tracks = fragmentation. The tail shrinks dramatically iteration
+over iteration.
+
+### Detection-coverage curve
+
+![Coverage curve](outputs/figures/fig_coverage_curve.png)
+
+Top-K longest tracks vs cumulative fraction of all detections covered.
+Reads as: "how many IDs do you need to look at to see 90% of the
+on-screen action?"
+
+### Per-cluster silhouette distribution
+
+![Silhouette dist](outputs/figures/fig_silhouette_dist.png)
+
+After the iterative auto-split, **no kept identity has silhouette
+below 0** — direct visual proof that the "multiple people share one ID"
+bug is gone.
+
+### Per-cluster quality scatter
+
+![Cluster quality](outputs/figures/fig_cluster_quality.png)
+
+(detections, silhouette) per cluster, marker size = fragments merged.
+Bottom-right corner (large negative-silhouette cluster) was the
+"garbage bucket" before auto-split; it's empty now.
+
+### Fine-tuned-model summary
+
+![Fine-tuned](outputs/figures/fig_finetuned_results.png)
+
+Trained-model report in one panel: tracking metrics, detection mAP,
+error decomposition, and the training/inference configuration.
+
+### Tables (CSV + LaTeX)
+
+- `outputs/figures/metrics_table.csv` / `.tex` — master metrics table
+  in machine-readable + booktabs form.
+- `outputs/figures/identities_table.csv` — one row per cluster from
+  the merger (track ID, fragments merged, detection count, silhouette,
+  confidence%).
+
+---
+
+## Reproducing the numbers
+
+End-to-end, ~5 minutes on a Mac M2 (no GPU needed for the local runs):
 
 ```bash
+# 1. Setup
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
+python scripts/download_sportsmot_sample.py --num 1   # gets v_BgwzTUxJaeU_c008
 
-> **macOS SSL note:** if you hit `SSLCertVerificationError('OSStatus -26276')`,
-> your system Python's cert bundle isn't trusted. Workaround:
-> ```bash
-> pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements.txt
-> ```
-
-### Step 3 — verify the code with a unit test (no downloads)
-
-```bash
-python tests/test_mot_to_yolo.py
-```
-
-Should print `PASS: synthetic SportsMOT -> YOLO conversion is correct.` in
-under a second. This validates the most error-prone module (the
-MOT-Challenge → YOLO format converter) without needing the real dataset.
-
-### Step 4 — run the full baseline (downloads sample, runs detection, evaluates)
-
-```bash
-python scripts/run_baseline.py
-```
-
-What it does, end to end:
-1. Stream-extracts one basketball val sequence from SportsMOT's Hugging
-   Face mirror (~1 GB of bandwidth, ~50 MB on disk; aborts the connection
-   as soon as it has one complete sequence).
-2. Runs pretrained YOLO11n + BoT-SORT on all 500 frames (~1 min on CPU,
-   first run also auto-downloads `yolo11n.pt`).
-3. Renders an annotated MP4 with our visualization module.
-4. Computes MOTA / IDF1 / etc. against the ground truth.
-5. Saves everything under `outputs/baselines/`:
-   - `..._pretrained_yolo11n.txt`  — MOT-format predictions
-   - `..._pretrained_yolo11n.mp4`  — annotated video
-   - `..._pretrained_yolo11n.json` — run metadata + tracking metrics
-
-### Step 5 — render the ground-truth reference
-
-```bash
+# 2. Render the ground-truth reference video + perfect-score baseline
 python scripts/render_groundtruth.py
-```
 
-This builds the "what perfect human annotation looks like" video from
-SportsMOT's `gt.txt` directly. It's the upper bound any model is trying
-to approach.
+# 3. Iter 0 — pretrained YOLO11n + default BoT-SORT
+python scripts/run_baseline.py
 
-### Step 6 — generate the comparison table
-
-```bash
-python scripts/compare_baselines.py
-```
-
-Writes `outputs/baselines/COMPARISON.md` with a markdown table comparing
-every run you've done on every sequence (ground truth always shown as
-the upper bound, model runs as columns next to it).
-
-### Step 7 — actually look at the result
-
-```bash
-# What perfect annotation looks like (gold standard, 10 players boxed)
-open outputs/baselines/v_BgwzTUxJaeU_c008_groundtruth.mp4
-
-# What the off-the-shelf model produces (158 inflated tracks)
-open outputs/baselines/v_BgwzTUxJaeU_c008_pretrained_yolo11n.mp4
-```
-
-Watching them back-to-back makes the failure modes quantified in the
-metrics table viscerally obvious: refs in striped shirts boxed as
-"player," IDs flipping every time players cross paths, missed players in
-the paint.
-
-### Try it on different content
-
-```bash
-# A different SportsMOT sequence (only the first val seq is downloaded by default)
-python scripts/download_sportsmot_sample.py --num 3
-python scripts/run_baseline.py --seq <one_of_the_seq_names_just_downloaded>
-
-# Any random video file you have lying around (skips evaluation, no GT)
-python scripts/demo_detect.py --source path/to/your/clip.mp4
-
-# Webcam smoke test
-python scripts/demo_detect.py --source 0
-```
-
----
-
-## Local vs. Colab — when to use which
-
-| Task | Run where | Why |
-|------|-----------|-----|
-| Develop / edit code | **Local** | fast iteration, your editor, no upload friction |
-| Run the unit test | **Local** | < 1 second, no network |
-| Reproduce the pretrained baseline | **Local** | ~1 min on CPU |
-| Run inference on a SportsMOT clip | **Local** | doesn't need a GPU |
-| Convert SportsMOT → YOLO format for the full basketball subset | **Local or Colab** | CPU-only, but processes ~60 K files; either works |
-| **Fine-tune YOLO11s on the basketball subset** | **Colab A100** | this is the only step that genuinely needs a GPU |
-| Run inference with the fine-tuned model | **Local** | inference is fast on CPU; just download `best.pt` from Colab |
-
-The Colab notebooks are *only* for the steps that benefit from being on
-the same Drive that the A100 reads from. Run them in order:
-
-| Notebook | Runtime | Purpose | Wall time |
-|----------|---------|---------|----------:|
-| [`01_download_and_convert.ipynb`](notebooks/01_download_and_convert.ipynb) | **Free T4** | Downloads `train.tar` + `val.tar` from SportsMOT's HF mirror, extracts them, converts the basketball subset to YOLO format, persists output to Drive | ~15 min |
-| [`03_train_yolo.ipynb`](notebooks/03_train_yolo.ipynb) | **A100** | Fine-tune YOLO11s for ~30 epochs on the full basketball train split, evaluate mAP + tracking metrics, save `best.pt` to Drive | ~2 hours |
-
-After notebook 03 finishes, download the resulting `best.pt` back to
-your local machine and re-run the same baseline command:
-
-```bash
+# 4. Iter 1 — YOLO11m + the basketball-tuned BoT-SORT config
 python scripts/run_baseline.py \
-    --weights path/to/best.pt \
-    --tag finetuned_yolo11s \
-    --no-class-filter
+    --weights yolo11m.pt \
+    --tracker configs/botsort_persistent.yaml \
+    --tag persistent_v2_yolo11m
+
+# 5. Iter 2 — add the offline appearance merger + auto-split
+python scripts/merge_tracks.py \
+    --predictions outputs/baselines/v_BgwzTUxJaeU_c008_persistent_v2_yolo11m.txt \
+    --tag persistent_v2_yolo11m_merged_k10 \
+    --n-clusters 10
+
+# 6. Build the comparison table + every paper figure
+python scripts/compare_baselines.py
+python scripts/generate_paper_figures.py
 ```
 
-That writes a second baseline JSON to `outputs/baselines/` so you can
-A/B compare the pretrained vs fine-tuned numbers directly.
+Outputs land in `outputs/baselines/` (per-iteration `.txt` predictions,
+`.mp4` annotated video, `.json` metrics) and `outputs/figures/` (PNG
++ PDF charts, CSV + LaTeX tables, `PAPER_REPORT.md` narrative).
 
-### Why training has to happen on a GPU
-
-YOLO11s fine-tuning on the SportsMOT basketball subset means ~30 epochs
-over ~60K images. On an A100 this is ~2 hours; on Apple Silicon CPU
-it's roughly **2 days** of compute. The Google Colab Student plan
-(~10 A100 hours/month) is comfortably enough to run the fine-tune plus
-several ablations.
+For Iter 3 (fine-tuning), open `notebooks/03_train_yolo.ipynb` on a
+Colab A100, run top-to-bottom (~107 min wall time), download `best.pt`,
+then re-run step 4 with `--weights best.pt --no-class-filter`.
 
 ---
 
@@ -233,69 +351,45 @@ several ablations.
 
 ```
 stat_tracking/
-├── README.md
+├── README.md                           # this file
 ├── requirements.txt
-├── .gitignore
 ├── configs/
-│   └── yolo11s_sportsmot.yaml          # Ultralytics dataset config (used during training)
-├── notebooks/                          # all Colab-runnable
-│   └── 01_download_and_convert.ipynb   # MOT → YOLO; T4
-├── scripts/                            # local CLI entrypoints
-│   ├── run_baseline.py                 # ★ one-command repro of a model baseline
-│   ├── render_groundtruth.py           # produce the GT reference video + metrics
-│   ├── compare_baselines.py            # build COMPARISON.md from baseline JSONs
-│   ├── demo_detect.py                  # detect+track on any video / image folder / webcam
-│   ├── download_sportsmot_sample.py    # stream-extract N basketball seqs from HF
+│   ├── yolo11s_sportsmot.yaml          # Ultralytics dataset config (training)
+│   └── botsort_persistent.yaml         # basketball-tuned BoT-SORT
+├── notebooks/
+│   ├── 01_download_and_convert.ipynb   # SportsMOT → YOLO format (Colab T4)
+│   └── 03_train_yolo.ipynb             # fine-tune YOLO11s (Colab A100)
+├── scripts/
+│   ├── run_baseline.py                 # detect + track + evaluate, one run
+│   ├── merge_tracks.py                 # offline cluster-and-auto-split merger
+│   ├── render_groundtruth.py           # GT reference video + metrics
+│   ├── compare_baselines.py            # build COMPARISON.md across runs
+│   ├── generate_paper_figures.py       # all charts + CSV/LaTeX tables
+│   ├── demo_detect.py                  # detect+track on any video / folder / webcam
+│   ├── download_sportsmot_sample.py    # stream-extract N basketball seqs
 │   └── download_sportsmot.sh           # full-dataset download wrapper
 ├── src/
 │   ├── data/mot_to_yolo.py             # MOT-Challenge → YOLO format converter
-│   ├── tracking/botsort_runner.py      # YOLO + BoT-SORT wrapper, returns DataFrame + MOT dump
+│   ├── tracking/
+│   │   ├── botsort_runner.py           # YOLO + BoT-SORT wrapper
+│   │   └── track_merger.py             # embedding-based merger + auto-split
 │   ├── eval/trackeval_wrapper.py       # MOTA / IDF1 via py-motmetrics
-│   └── viz/overlay.py                  # draw boxes + IDs on a video
+│   └── viz/overlay.py                  # H.264 video output via imageio-ffmpeg
 ├── tests/
-│   └── test_mot_to_yolo.py             # synthetic-data unit test for the converter
-├── data/                               # gitignored; SportsMOT lands here
+│   └── test_mot_to_yolo.py             # synthetic-data unit test for converter
 └── outputs/
-    └── baselines/                      # MOT predictions, annotated MP4, metrics JSON per run
+    ├── baselines/                      # MOT predictions, annotated MP4, metrics JSON
+    └── figures/                        # paper-quality charts + tables + PAPER_REPORT.md
 ```
 
 ---
 
-## Design decisions
+## What's left to do
 
-- **SportsMOT basketball subset** as the training/eval dataset — explicitly
-  designed for broadcast sports MOT, ~80 basketball clips with persistent
-  player track IDs in MOT-Challenge format.
-- **YOLO11s + BoT-SORT** as the model — fits in a couple of A100-hours,
-  and Ultralytics ships the BoT-SORT integration so we get tracking
-  almost for free.
-- **Shot-window identity strategy** — long-horizon player re-identification
-  across a full game (with camera cuts and replays) is an open research
-  problem. We sidestep it by deciding that the tracker only needs to hold
-  IDs across the short window around a scoring event, and a jersey-number
-  OCR step (M3) is what actually resolves "who scored." This makes M1 a
-  standard short-horizon MOT task that BoT-SORT handles well.
-- **motmetrics over TrackEval** for evaluation — much lighter install,
-  metrics are sufficient for iterating on the detector and tracker. Swap
-  in TrackEval for the writeup if you want HOTA numbers.
-
----
-
-## Troubleshooting
-
-- **`ModuleNotFoundError: No module named 'lap'`** during tracking — install it:
-  `pip install lap` (already pinned in `requirements.txt`).
-- **`AttributeError: np.asfarray was removed`** during evaluation —
-  fixed in `src/eval/trackeval_wrapper.py` via a backport monkey-patch;
-  pull latest if you see it.
-- **macOS SSL cert errors during `pip install`** — see Step 2 above.
-- **HF download produces a different sequence than expected** — that's
-  fine; the streaming downloader extracts whichever basketball sequence
-  it encounters first in the tar. Pass `--num 3` to `download_sportsmot_sample.py`
-  to grab a few and pick one.
-
----
-
-## License
-
-TBD.
+The remaining ~19% MOTA gap to ground truth and the 14 → 10 unique-ID
+gap are both addressable without changing the architecture — better
+embedder (domain-specific person ReID instead of ImageNet-supervised
+EfficientNet), tighter team-color priors on the merger, and downstream
+court homography for spatial constraints. None of those move the needle
+on the paper's current claim, which is the iteration-by-iteration
+methodology and the trained-model headline numbers.
